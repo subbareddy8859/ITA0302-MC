@@ -1,0 +1,130 @@
+class MainActivity : AppCompatActivity() {
+    private lateinit var tfLiteModel: Interpreter
+    private lateinit var authorizedEmbedding: FloatArray
+    private lateinit var faceDetector: FaceDetector
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        faceDetector = FaceDetection.getClient(FaceDetectorOptions.Builder()
+            .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+            .build())
+
+        tfLiteModel = Interpreter(loadModelFile("facenet.tflite"))
+        authorizedEmbedding = getStoredFaceEmbedding("authorized_face.jpg")
+
+        startCamera()
+    }
+
+    private fun startCamera() {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        cameraProviderFuture.addListener({
+            val cameraProvider = cameraProviderFuture.get()
+            val preview = Preview.Builder().build()
+            val previewView = findViewById<PreviewView>(R.id.previewView)
+            preview.setSurfaceProvider(previewView.surfaceProvider)
+
+            val imageAnalyzer = ImageAnalysis.Builder().build().also {
+                it.setAnalyzer(ContextCompat.getMainExecutor(this), FaceAnalyzer())
+            }
+
+            val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
+            cameraProvider.unbindAll()
+            cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalyzer)
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun getStoredFaceEmbedding(filename: String): FloatArray {
+        val bitmap = BitmapFactory.decodeStream(assets.open(filename))
+        return extractFaceEmbedding(bitmap)
+    }
+
+    private fun extractFaceEmbedding(bitmap: Bitmap): FloatArray {
+        val input = preprocessImage(bitmap)
+        val output = Array(1) { FloatArray(128) }
+        tfLiteModel.run(input, output)
+        return output[0]
+    }
+
+    private fun preprocessImage(bitmap: Bitmap): Array<Array<Array<FloatArray>>> {
+        val resized = Bitmap.createScaledBitmap(bitmap, 160, 160, true)
+        val input = Array(1) { Array(160) { Array(160) { FloatArray(3) } } }
+        for (y in 0 until 160) {
+            for (x in 0 until 160) {
+                val px = resized.getPixel(x, y)
+                input[0][y][x][0] = (Color.red(px) - 127.5f) / 128f
+                input[0][y][x][1] = (Color.green(px) - 127.5f) / 128f
+                input[0][y][x][2] = (Color.blue(px) - 127.5f) / 128f
+            }
+        }
+        return input
+    }
+
+    inner class FaceAnalyzer : ImageAnalysis.Analyzer {
+        override fun analyze(imageProxy: ImageProxy) {
+            val mediaImage = imageProxy.image ?: return
+            val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+
+            faceDetector.process(image)
+                .addOnSuccessListener { faces ->
+                    if (faces.isNotEmpty()) {
+                        val face = faces[0]
+                        val bitmap = image.mediaImage!!.toBitmap()
+                        val croppedFace = cropFace(bitmap, face.boundingBox)
+                        val embedding = extractFaceEmbedding(croppedFace)
+                        val similarity = cosineSimilarity(authorizedEmbedding, embedding)
+
+                        if (similarity > 0.85f) {
+                            Toast.makeText(applicationContext, "Face matched! Access granted.", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+                .addOnCompleteListener { imageProxy.close() }
+        }
+    }
+
+    private fun cropFace(bitmap: Bitmap, box: Rect): Bitmap {
+        val safeRect = Rect(
+            max(0, box.left),
+            max(0, box.top),
+            min(bitmap.width, box.right),
+            min(bitmap.height, box.bottom)
+        )
+        return Bitmap.createBitmap(bitmap, safeRect.left, safeRect.top, safeRect.width(), safeRect.height())
+    }
+
+    private fun cosineSimilarity(vec1: FloatArray, vec2: FloatArray): Float {
+        var dot = 0f
+        var norm1 = 0f
+        var norm2 = 0f
+        for (i in vec1.indices) {
+            dot += vec1[i] * vec2[i]
+            norm1 += vec1[i] * vec1[i]
+            norm2 += vec2[i] * vec2[i]
+        }
+        return dot / (sqrt(norm1) * sqrt(norm2))
+    }
+
+    private fun loadModelFile(fileName: String): MappedByteBuffer {
+        val fileDescriptor = assets.openFd(fileName)
+        val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
+        val fileChannel = inputStream.channel
+        return fileChannel.map(FileChannel.MapMode.READ_ONLY, fileDescriptor.startOffset, fileDescriptor.declaredLength)
+    }
+
+    private fun Image.toBitmap(): Bitmap {
+        val yBuffer = planes[0].buffer
+        val vuBuffer = planes[2].buffer
+
+        val nv21 = ByteArray(yBuffer.remaining() + vuBuffer.remaining())
+        yBuffer.get(nv21, 0, yBuffer.remaining())
+        vuBuffer.get(nv21, yBuffer.remaining(), vuBuffer.remaining())
+
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+        val out = ByteArrayOutputStream()
+        yuvImage.compressToJpeg(Rect(0, 0, width, height), 90, out)
+        val imageBytes = out.toByteArray()
+        return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+    }
+}
